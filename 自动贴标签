@@ -1,0 +1,1129 @@
+import sys
+import os
+import time
+import json
+import re
+import requests
+import openpyxl
+from datetime import datetime, timedelta
+from collections import defaultdict
+from configparser import ConfigParser
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLineEdit, QPushButton, QVBoxLayout,
+    QHBoxLayout, QFileDialog, QMessageBox, QDateTimeEdit, QGroupBox, QLabel,
+    QProgressBar
+)
+from PyQt5.QtCore import QDateTime, QTime, QRunnable, pyqtSignal, QObject, QThreadPool, QTimer, Qt, QByteArray
+from PyQt5.QtGui import QPixmap, QIcon
+
+# =========================
+#  常量：chunk 主机与文件（写死，用户不可见）
+# =========================
+CHUNK_HOST = "v.boinht.com"
+CHUNK_FILE = "chunk-e0740300.5b088cd2.js"
+
+# 可选调试开关（True 会打印少量关键日志；False 静默）
+DEBUG = False
+
+# =========================
+#  外置：仅保留标签规则（判名来自 chunk）
+# =========================
+TAG_RULES_FILE = "tag_rules.json"
+
+DEFAULT_TAG_RULES = {
+    "defaults_by_platform": {
+        "東方彩票": "彩票客",
+        "東方彩票大厅": "彩票客",
+        "KY棋牌": "棋牌客",
+        "JDB奪寶電子": "电子客",
+        "AG視訊電子": "视讯客",
+        "DG視訊": "视讯客",
+        "VR彩票": "彩票客",
+        "WM完美視訊": "视讯客",
+        "PT棋牌": "棋牌客",
+        "龍城棋牌": "棋牌客",
+        "BG棋牌": "棋牌客",
+        "CQ9棋牌": "电子客",
+        "亞星視訊": "视讯客",
+        "博乐棋牌": "棋牌客",
+        "凱旋棋牌": "棋牌客",
+        "FC发财电子": "电子客",
+        "瓦力游戏": "棋牌客",
+        "BBIN": "棋牌客",
+        "环亚棋牌": "棋牌客",
+        "乐游棋牌": "棋牌客",
+        "CR体育": "体育客",
+        "PG电子": "电子客",
+        "TP": "电子客",
+        "MG": "电子客"
+    },
+    "rules": [
+        {
+            "priority": 101,
+            "platform_in": ["KY棋牌"],
+            "game_name_contains_any": ["體育"],
+            "tag": "体育客"
+        },
+        {
+            "priority": 100,
+            "platform_in": ["KY棋牌"],
+            "game_name_contains_any": ["捕魚", "金鯊"],
+            "tag": "捕鱼客"
+        },
+        {
+            "priority": 100,
+            "platform_in": ["JDB奪寶電子", "AG視訊電子", "DG視訊", "WM完美視訊", "BG棋牌", "博乐棋牌", "CQ9棋牌",
+                            "瓦力游戏", "FC发财电子"],
+            "game_name_contains_any": ["捕魚", "漁場"],
+            "tag": "捕鱼客"
+        },
+        {
+            "priority": 90,
+            "platform_in": ["瓦力游戏"],
+            "game_name_contains_any": ["視訊"],
+            "tag": "视讯客"
+        }
+    ],
+    "fallback": "未分类"
+}
+
+
+# =========================
+#  工具：路径/读写
+# =========================
+def program_dir() -> str:
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def tag_rules_path() -> str:
+    return os.path.join(program_dir(), TAG_RULES_FILE)
+
+
+def write_tag_rules_template_if_missing():
+    p = tag_rules_path()
+    if not os.path.exists(p):
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_TAG_RULES, f, ensure_ascii=False, indent=2)
+
+
+def _validate_tag_rules(data: dict):
+    if not isinstance(data, dict):
+        raise ValueError("tag_rules.json 顶层必须是对象。")
+    if not isinstance(data.get("defaults_by_platform", {}), dict):
+        raise ValueError("defaults_by_platform 必须是对象。")
+    if not isinstance(data.get("rules", []), list):
+        raise ValueError("rules 必须是数组。")
+    if not isinstance(data.get("fallback", "未分类"), str):
+        raise ValueError("fallback 必须是字符串。")
+
+
+def load_tag_rules_with_fallback(parent_widget=None) -> dict:
+    p = tag_rules_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _validate_tag_rules(data)
+        return data
+    except FileNotFoundError:
+        write_tag_rules_template_if_missing()
+        if parent_widget:
+            QMessageBox.information(parent_widget, "提示", f"未找到 {TAG_RULES_FILE}，已生成模板，将使用默认规则运行。")
+        return json.loads(json.dumps(DEFAULT_TAG_RULES, ensure_ascii=False))
+    except Exception as e:
+        if parent_widget:
+            QMessageBox.warning(parent_widget, "规则读取失败", f"{TAG_RULES_FILE} 解析失败，将使用默认规则运行。\n\n{e}")
+        return json.loads(json.dumps(DEFAULT_TAG_RULES, ensure_ascii=False))
+
+
+# =========================
+#  抓取 & 解析 chunk：得到 ChessPIDs / ChessList
+# =========================
+def _http_get(url, token, timeout=10, retries=2):
+    headers = {'Cookie': f'token={token}', 'User-Agent': 'Mozilla/5.0'}
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            if DEBUG: print(f"[DBG] GET {url} (try {attempt + 1})")
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if DEBUG: print("[DBG] status =", r.status_code, "len =", len(r.text or ""))
+            if r.status_code == 200 and r.text:
+                return r.text
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+            if DEBUG: print("[DBG] exception:", last_err)
+        time.sleep(1)
+    raise RuntimeError(f"GET {url} 失败：{last_err}")
+
+
+def _find_balanced_block(text, start_idx, open_char='{', close_char='}'):
+    i = text.find(open_char, start_idx)
+    if i == -1: return None, -1
+    depth, j = 0, i
+    while j < len(text):
+        c = text[j]
+        if c == open_char:
+            depth += 1
+        elif c == close_char:
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1], j + 1
+        j += 1
+    return None, -1
+
+
+def _clean_js_for_json(js_text, const_map=None):
+    import re, json
+    t = js_text.strip()
+    t = t.replace('\r', '').replace('\n', ' ')
+    t = t.replace("'", '"')
+    t = t.replace('!0', 'true').replace('!1', 'false')
+    t = re.sub(r",\s*([}\]])", r"\1", t)
+
+    # 常量替换：支持任意变量名 & 任意常量（包含 GAME_TYPE_*）
+    if const_map:
+        def repl_const(m):
+            full = m.group(1)  # 变量名.常量名
+            suf = m.group(2)  # 常量名（后缀）
+            val = const_map.get(full, const_map.get(suf))
+            if val is None:
+                return full
+            return json.dumps(val, ensure_ascii=False)
+
+        t = re.sub(r'([A-Za-z_$][\w$]*\.([A-Z0-9_]+))', repl_const, t)
+
+    # 键名补引号
+    t = re.sub(r'\{\s*([A-Za-z0-9_\-]+)\s*:', r'{"\1":', t)
+    t = re.sub(r',\s*([A-Za-z0-9_\-]+)\s*:', r',"\1":', t)
+    return t
+
+
+def parse_chunk_for_chess(text):
+    """
+    返回：
+      platform_names: {pid -> 平台中文名}
+      chess_list: {"ky":[{id,name,params,...},...], ...}
+    """
+    import re, json
+
+    # 常量表（任意变量名.常量，支持字符串或数字）
+    const_map = {}
+    for m in re.finditer(
+            r'([A-Za-z_$][\w$]*\.([A-Z0-9_]+))\s*=\s*(?:"([^"]+)"|([0-9]+))',
+            text
+    ):
+        full_name = m.group(1)  # 如 m.GAME_PLATFORM_TYPE_KYQP / m.GAME_TYPE_FS_QP
+        suffix = m.group(2)  # 如 GAME_PLATFORM_TYPE_KYQP / GAME_TYPE_FS_QP
+        str_val = m.group(3)
+        num_val = m.group(4)
+        value = str_val if str_val is not None else (int(num_val) if num_val is not None else None)
+        if value is not None:
+            const_map[full_name] = value
+            const_map[suffix] = value
+
+    # ChessPIDs
+    m_pids = re.search(r'ChessPIDs\s*=\s*', text)
+    if DEBUG: print("[DBG] has ChessPIDs =", bool(m_pids))
+    platform_names = {}
+    if m_pids:
+        start = text.find('[', m_pids.end())
+        block, _ = _find_balanced_block(text, start, '[', ']')
+        if block:
+            pids_json = _clean_js_for_json(block, const_map)
+            pids_arr = json.loads(pids_json)
+            for item in pids_arr:
+                pid = item.get('pid')
+                name = item.get('name')
+                if pid and name and pid != "":
+                    platform_names[pid] = name
+    if DEBUG: print("[DBG] platform_names count =", len(platform_names))
+
+    # ChessList
+    m_list = re.search(r'ChessList\s*=\s*', text)
+    if DEBUG: print("[DBG] has ChessList =", bool(m_list))
+    chess_list = {}
+    if m_list:
+        obj_text, _ = _find_balanced_block(text, m_list.end(), '{', '}')
+        if obj_text:
+            list_json = _clean_js_for_json(obj_text, const_map)
+            chess_list = json.loads(list_json)
+            if DEBUG: print("[DBG] chess_list keys =", list(chess_list.keys())[:10])
+
+    return platform_names, chess_list
+
+
+# =========================
+#  按前端逻辑“判名”
+# =========================
+def _to_int(v):
+    try:
+        return int(v)
+    except Exception:
+        return v
+
+
+def resolve_game_name(pid, game_type, chess_list_for_pid):
+    if not chess_list_for_pid or not isinstance(chess_list_for_pid, list):
+        return ""
+    a = game_type
+    if isinstance(a, str):
+        try:
+            a = json.loads(a)
+        except Exception:
+            return ""
+    if not isinstance(a, dict):
+        return ""
+
+    for p in chess_list_for_pid:
+        params = p.get('params', {})
+        name = p.get('name', '')
+        if not name or not isinstance(params, dict):
+            continue
+        try:
+            if pid in ('ky', 'lc', 'kxqp', 'kxbp'):
+                if 'KindID' in params and _to_int(params['KindID']) == _to_int(a.get('KindID')): return name
+            elif pid == 'jdb':
+                if _to_int(params.get('gType')) == _to_int(a.get('gType')) and _to_int(params.get('mType')) == _to_int(
+                    a.get('mType')): return name
+            elif pid == 'ag':
+                if params.get('gameType') == a.get('gameType'): return name
+            elif pid == 'dg':
+                if params.get('gameId') == a.get('gameId'): return name
+            elif pid == 'vr':
+                if _to_int(params.get('channelId')) == _to_int(a.get('channelId')): return name
+            elif pid == 'wm':
+                if params.get('mode') == a.get('mode'): return name
+            elif pid == 'pt':
+                if params.get('PtGame') == a.get('PtGame'): return name
+            elif pid == 'bg':
+                if params.get('BG_GameId') == a.get('BG_GameId') and params.get('BG_GameType') == a.get(
+                    'BG_GameType'): return name
+            elif pid == 'xj':
+                if params.get('xj_gameType') == a.get('xj_gameType'): return name
+            elif pid == 'cq9':
+                if params.get('gameCode') == a.get('gameCode'):
+                    if 'tableType' in a:
+                        if params.get('tableType') == a.get('tableType'):
+                            return name
+                        else:
+                            continue
+                    return name
+            elif pid in ('ebet', 'wnsr'):
+                if params.get('gameCode') == a.get('gameCode'): return name
+            elif pid == 'jbcp':
+                if _to_int(params.get('jbcpType')) == _to_int(a.get('jbcpType')): return name
+            elif pid == 'cp_lobby':
+                if _to_int(params.get('cpLobbyType')) == _to_int(a.get('cpLobbyType')): return name
+            elif pid == 'yxsx':
+                if _to_int(params.get('yxsxType')) == _to_int(a.get('yxsxType')): return name
+            elif pid == 'dt':
+                if _to_int(params.get('dtType')) == _to_int(a.get('dtType')): return name
+            elif pid == 'blqp':
+                if _to_int(params.get('Bl1')) == _to_int(a.get('Bl1')) and _to_int(params.get('Bl2')) == _to_int(
+                        a.get('Bl2')):
+                    if 'Bl3' in a:
+                        if _to_int(params.get('Bl3')) == _to_int(a.get('Bl3')):
+                            return name
+                        else:
+                            continue
+                    return name
+            elif pid == 'fc':
+                if _to_int(params.get('FcType')) == _to_int(a.get('FcType')): return name
+            elif pid == 'wl':
+                if _to_int(params.get('WlType')) == _to_int(a.get('WlType')): return name
+            elif pid == 'hy':
+                if _to_int(params.get('HyType')) == _to_int(a.get('HyType')): return name
+            elif pid == 'cr':
+                if params.get('cr_gameType') == a.get('cr_gameType'): return name
+            elif pid == 'lm':
+                if params.get('LmType') == a.get('LmType'): return name
+            elif pid == 'pg':
+                if _to_int(params.get('PgType')) == _to_int(a.get('PgType')): return name
+            elif pid == 'ly':
+                if _to_int(params.get('LyType')) == _to_int(a.get('LyType')): return name
+            elif pid == 'mg':
+                if _to_int(params.get('MgType')) == _to_int(a.get('MgType')): return name
+            elif pid == 'bbin':
+                if _to_int(params.get('BbinType')) == _to_int(a.get('BbinType')) and _to_int(
+                        params.get('gameCode')) == _to_int(a.get('gameCode')):
+                    if 'tableId' in a:
+                        if params.get('tableId') == a.get('tableId'):
+                            return name
+                        else:
+                            continue
+                    return name
+            elif pid == 'tp':
+                if params.get('tp_gameCode') == a.get('tp_gameCode'): return name
+            elif pid == 'pp':
+                if params.get('gameId') == a.get('gameId'): return name
+        except Exception:
+            continue
+    return ""
+
+
+# =========================
+#  线程信号
+# =========================
+class WorkerSignals(QObject):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    # 新增：进度（已处理，总数）
+    progress = pyqtSignal(int, int)
+
+
+# =========================
+#  工作线程：拉日志 → 判名 → 贴标签 → 导出
+# =========================
+class LogFetchWorker(QRunnable):
+    def __init__(self, user_ids, kssjld, jssjld, port, token, code,
+                 tag_rules, timeout=15):
+        super().__init__()
+        self.user_ids = user_ids
+        self.kssjld = kssjld
+        self.jssjld = jssjld
+        self.port = port
+        self.token = token
+        self.code = code
+        self.tag_rules = dict(tag_rules or {})
+        self.timeout = timeout
+        self.signals = WorkerSignals()
+
+        rules = self.tag_rules.get("rules", [])
+        for r in rules:
+            if "priority" not in r: r["priority"] = 0
+        self.sorted_rules = sorted(rules, key=lambda x: x.get("priority", 0), reverse=True)
+        self.defaults_by_platform = self.tag_rules.get("defaults_by_platform", {})
+        self.fallback_tag = self.tag_rules.get("fallback", "未分类")
+
+        # 进度统计
+        self.total = len(user_ids)
+        self.processed = 0
+
+    def _match_rule(self, platform: str, game_name: str, rule: dict) -> bool:
+        plat = platform or "";
+        name = game_name or ""
+        if "platform_in" in rule and plat not in rule["platform_in"]: return False
+        if "platform_not_in" in rule and plat in rule["platform_not_in"]: return False
+        if "game_name_contains_any" in rule and not any(k in name for k in rule["game_name_contains_any"]): return False
+        if "game_name_contains_all" in rule and not all(k in name for k in rule["game_name_contains_all"]): return False
+        if "game_name_regex" in rule:
+            try:
+                if not re.search(rule["game_name_regex"], name, flags=re.IGNORECASE): return False
+            except re.error:
+                return False
+        return True
+
+    def determine_tag(self, plat: str, gname: str):
+        for rule in self.sorted_rules:
+            if self._match_rule(plat, gname, rule):
+                return rule["tag"], "rule"
+        if plat in self.defaults_by_platform:
+            return self.defaults_by_platform[plat], "default"
+        return self.fallback_tag, "fallback"
+
+    def _emit_progress(self):
+        self.processed += 1
+        try:
+            self.signals.progress.emit(self.processed, self.total)
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            # 1) 抓 chunk
+            chunk_url = f"http://{CHUNK_HOST}:{self.port}/js/{CHUNK_FILE}"
+            if DEBUG: print("[DBG] chunk_url =", chunk_url)
+            chunk_text = _http_get(chunk_url, self.token, timeout=10, retries=2)
+            platform_names, chess_list = parse_chunk_for_chess(chunk_text)
+            if not platform_names or not chess_list:
+                raise RuntimeError("未从 chunk 解析到 ChessPIDs/ChessList")
+
+            # 2) 拉日志
+            headers = {'Cookie': f'token={self.token}'}
+            url = f"http://v.boinht.com:{self.port}/pp_game_log/pf_list"
+
+            outwb = openpyxl.Workbook()
+            outws = outwb.active
+            outws.title = "标签结果"
+            outws.append(['游戏ID', '游戏平台', '游戏名', '标签', '标签来源'])
+
+            fallback_rows = []
+            no_name_rows = []
+            session = requests.Session()
+
+            for user_id in self.user_ids:
+                # ⚡ 关键修改：尝试将 user_id 转换为整数，以便 Excel 识别为数字类型
+                try:
+                    user_id_to_write = int(user_id)
+                except ValueError:
+                    user_id_to_write = user_id  # 如果转换失败（非数字），则保留原样
+
+                finished_one = False
+                retry = 0
+                while retry < 10:
+                    try:
+                        res = session.post(
+                            url, headers=headers,
+                            data={
+                                "user_id": user_id,
+                                "begin_time": self.kssjld,
+                                "end_time": self.jssjld,
+                                "page_size": 200,
+                                "page": 1,
+                                "login_code": self.code
+                            },
+                            timeout=self.timeout
+                        )
+                        if res.status_code != 200:
+                            retry += 1;
+                            time.sleep(3);
+                            continue
+
+                        result = res.json().get("result", [])
+                        if not result:
+                            # ⚡ 使用转换后的 user_id_to_write
+                            outws.append([user_id_to_write, '无数据', '无数据', '无数据', '无数据'])
+                            print(f"账号:{user_id} | 无数据")
+                            finished_one = True
+                            break
+
+                        counter = defaultdict(lambda: defaultdict(int))
+                        for entry in result:
+                            counter[entry['user_id']][(entry['pid'], entry['game_type'])] += 1
+
+                        for uid, counts in counter.items():
+                            (pid, gt), _ = max(counts.items(), key=lambda x: x[1])
+                            platform_cn = platform_names.get(pid, pid)
+
+                            gname = resolve_game_name(pid, gt, chess_list.get(pid))
+                            if not gname:
+                                try:
+                                    gt_view = json.dumps(json.loads(gt), ensure_ascii=False) if isinstance(gt,
+                                                                                                           str) else str(
+                                        gt)
+                                except Exception:
+                                    gt_view = str(gt)
+                                no_name_rows.append([uid, platform_cn, gt_view])
+                                gname = str(gt)
+
+                            tag, source = self.determine_tag(platform_cn, gname)
+                            # uid 来自请求结果，通常已经是数字格式，无需额外转换
+                            outws.append([uid, platform_cn, gname, tag, source])
+                            print(f"账号:{uid} | 平台:{platform_cn} | 游戏名:{gname} | 标签:{tag} | 来源:{source}")
+                            if source == "fallback":
+                                fallback_rows.append([uid, platform_cn, gname, tag])
+                        finished_one = True
+                        break
+                    except Exception:
+                        retry += 1
+                        time.sleep(3)
+
+                # 若重试耗尽仍未完成
+                if not finished_one:
+                    # ⚡ 使用转换后的 user_id_to_write
+                    outws.append([user_id_to_write, '无数据', '无数据', '无数据', '无数据'])
+
+                # —— 每个账号处理完后发进度 —— #
+                self._emit_progress()
+
+            ws_fb = outwb.create_sheet(title="未贴标签清单")
+            ws_fb.append(["游戏ID", "游戏平台", "游戏名", "当前标签（fallback）"])
+            if fallback_rows:
+                for row in fallback_rows:
+                    ws_fb.append(row)
+            else:
+                ws_fb.append(["（全部命中规则或平台默认，无需补充）", "", "", ""])
+
+            ws_nn = outwb.create_sheet(title="未匹配到游戏名")
+            ws_nn.append(["游戏ID", "平台", "原始 game_type（JSON）"])
+            if no_name_rows:
+                for row in no_name_rows:
+                    ws_nn.append(row)
+            else:
+                ws_nn.append(["（全部判名成功）", "", ""])
+
+            filename = f"标签数据_{datetime.now().strftime('%m月%d日%H时%M分%S秒')}.xlsx"
+            outwb.save(filename)
+            self.signals.finished.emit(filename)
+
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
+# =========================
+#  主窗口
+# =========================
+class GameLogApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("自动贴标签")
+        self.resize(1000, 700)
+        # 🌐 联网验证 + 时间验证
+        self.check_network_validation()
+
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.text_file_path = ""
+        self.user_ids = []
+        self.thread_pool = QThreadPool()
+
+        write_tag_rules_template_if_missing()
+        self.init_ui()
+        self.load_config()
+
+    def check_network_validation(self):
+        try:
+            program_id = "zb_tiebiaoqian1"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    def init_ui(self):
+        from PyQt5.QtWidgets import QStackedWidget, QFrame, QButtonGroup
+
+        # ================= 左侧导航 + 页面栈 =================
+        self.stack = QStackedWidget(self)
+
+        # --------- 页 1：操作页面（把你原来的UI搬到这里） ---------
+        op_page = QWidget(self)
+        op_root_v = QVBoxLayout(op_page)
+        op_root_v.setContentsMargins(0, 0, 0, 0)
+        op_root_v.setSpacing(0)
+
+        # 顶层垂直布局：主体区(左右两列) + 底部状态区
+        main_vlayout = QVBoxLayout()
+        main_vlayout.setContentsMargins(8, 8, 8, 8)
+        main_vlayout.setSpacing(8)
+
+        # 主体：左右两栏
+        body_layout = QHBoxLayout()
+
+        # 左侧：参数
+        left_group = QGroupBox("参数配置")
+        left_layout = QVBoxLayout()
+
+        self.token_edit = QLineEdit()
+        self.token_edit.setPlaceholderText("请输入 Cookie（token）")
+        self.port_edit = QLineEdit()
+        self.port_edit.setPlaceholderText("请输入端口号，例如 8080")
+        self.code_edit = QLineEdit()
+        self.code_edit.setPlaceholderText("请输入小明计算器登录码")
+
+        def add_row(label, w):
+            hb = QHBoxLayout()
+            lab = QLabel(label)
+            lab.setFixedWidth(60)
+            hb.addWidget(lab)
+            hb.addWidget(w)
+            left_layout.addLayout(hb)
+
+        add_row("🔑 Cookie:", self.token_edit)
+        add_row("🌐 端口号:", self.port_edit)
+        add_row("🔢 登录码:", self.code_edit)
+
+        self.save_btn = QPushButton("💾  保存配置")
+        self.save_btn.clicked.connect(self.save_config)
+        left_layout.addWidget(self.save_btn)
+        left_group.setLayout(left_layout)
+
+        # 右侧：操作
+        right_group = QGroupBox("功能操作")
+        right_layout = QVBoxLayout()
+
+        self.choose_file_btn = QPushButton("📄 导入游戏id（txt）")
+        self.choose_file_btn.clicked.connect(self.select_text_file)
+        right_layout.addWidget(self.choose_file_btn)
+
+        self.start_datetime = QDateTimeEdit()
+        self.start_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.start_datetime.setCalendarPopup(True)
+        self.start_datetime.wheelEvent = lambda e: e.ignore()
+        sd = QDateTime.currentDateTime()
+        sd.setTime(QTime(0, 0, 0))
+        self.start_datetime.setDateTime(sd)
+
+        self.end_datetime = QDateTimeEdit()
+        self.end_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.end_datetime.setCalendarPopup(True)
+        self.end_datetime.wheelEvent = lambda e: e.ignore()
+        ed = QDateTime.currentDateTime()
+        ed.setTime(QTime(23, 59, 59))
+        self.end_datetime.setDateTime(ed)
+
+        def add_row_r(label, w):
+            hb = QHBoxLayout()
+            lab = QLabel(label)
+            lab.setFixedWidth(50)
+            hb.addWidget(lab)
+            hb.addWidget(w)
+            right_layout.addLayout(hb)
+
+        add_row_r("开始时间:", self.start_datetime)
+        add_row_r("结束时间:", self.end_datetime)
+
+        self.yesterday_btn = QPushButton("📅 昨日")
+        self.yesterday_btn.clicked.connect(self.set_yesterday_range)
+        right_layout.addWidget(self.yesterday_btn)
+
+        self.run_btn = QPushButton("🚀 开始贴标签")
+        self.run_btn.clicked.connect(self.run_script)
+        right_layout.addWidget(self.run_btn)
+
+        right_group.setLayout(right_layout)
+
+        body_layout.addWidget(left_group, 1)
+        body_layout.addWidget(right_group, 1)
+
+        # —— 底部状态区（两行：上=导入账号/总数，下=进度条）—— #
+        footer = QVBoxLayout()
+        footer.setContentsMargins(6, 0, 6, 6)
+        footer.setSpacing(4)
+
+        self.progress_label = QLabel("已处理/总数：0 / 0")
+        self.progress_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.progress_label.setStyleSheet("color:#666;")
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setMinimumHeight(20)
+        self.progress_bar.setStyleSheet("""
+        QProgressBar {
+            border: 1px solid #cfcfcf;
+            border-radius: 10px;
+            background-color: #eeeeee;
+            text-align: center;
+            padding: 0px;
+            font-weight: bold;
+        }
+        QProgressBar::chunk {
+            border-radius: 9px;
+            background-color: #4CAF50;
+            margin: 1px;
+        }
+        """)
+
+        footer.addWidget(self.progress_label)
+        footer.addWidget(self.progress_bar)
+
+        self.contact_label = QLabel('<a href="https://t.me/fugui500">联系我</a>')
+        self.contact_label.setOpenExternalLinks(True)
+        footer.addWidget(self.contact_label, alignment=Qt.AlignLeft)
+
+        # 组装操作页
+        main_vlayout.addLayout(body_layout, 1)
+        main_vlayout.addLayout(footer)
+        op_root_v.addLayout(main_vlayout)
+        self.stack.addWidget(op_page)  # index 0
+
+        # --------- 页 2：关于 ---------
+        about_page = QWidget(self)
+        ab_v = QVBoxLayout(about_page)
+        ab_v.setContentsMargins(24, 24, 24, 24)
+        ab_v.setSpacing(12)
+
+        title = QLabel("关于本工具")
+        title.setStyleSheet("font-size:20px; font-weight:600;")
+
+        # 1. 重新添加版本信息标签 (Version Label)
+        version_info = QLabel("版本：v1.0.0")
+        version_info.setStyleSheet("font-size:16px; font-weight:600; color: #777777;")
+
+        # 2. 更新 desc 标签的内容为最终组合内容 (Description/Statement Label)
+        desc = QLabel(
+            "**工具信息：**\n"
+            "• 用途：**查询指定账号的游戏数据记录，识别玩过的游戏、进行贴标签（分类标记），并将结果导出 Excel。**\n"  # <== 描述已修改并加上导出功能
+            "• 操作：在左侧切换到「操作页面」，填写参数后开始查询。\n\n"
+
+            "**声明：**\n"
+            "本软件仅供**具备已获授权的账户**使用，使用者应确保数据与账号来源合规、授权充分，\n"
+            "并对自身操作及结果承担全部责任。因授权不足或违规使用导致的任何损失，均由使用者自行承担。\n\n"
+            "本软件按“现状”提供，不作任何明示或默示担保；作者对因使用或无法使用本软件造成的任何直接或间接损失不承担责任。\n\n"
+
+            "**继续使用即表示您已阅读、理解并同意本声明。**"
+        )
+
+        # 确保长文本可以自动换行
+        desc.setWordWrap(True)
+
+        # 3. 按顺序添加到布局中
+        ab_v.addWidget(title)
+        ab_v.addWidget(version_info)  # 添加版本信息
+        ab_v.addWidget(desc)  # 添加组合后的内容
+        ab_v.addStretch(1)
+
+        self.stack.addWidget(about_page)  # index 1
+
+        # --------- 左侧导航（黑色整栏、美化） ---------
+        nav_wrap = QFrame(self)
+        nav_wrap.setObjectName("NavWrap")
+        nav_layout = QVBoxLayout(nav_wrap)
+        nav_layout.setContentsMargins(14, 14, 14, 14)
+        nav_layout.setSpacing(13)
+
+        self.btn_oper = QPushButton("操作页面")
+        self.btn_about = QPushButton("关于")
+        for btn in (self.btn_oper, self.btn_about):
+            btn.setCheckable(True)
+            btn.setProperty("nav", True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(48)
+
+        nav_wrap.setStyleSheet("""
+        #NavWrap {
+            background: #3b4b6b;               /* 整个左侧栏深蓝灰底 */
+            border-radius: 10px;               /* 容器的边角设置为 10 像素圆角 */
+        }
+
+        /* 默认（未选中未悬停）：深色按钮、白字 */
+        QPushButton[nav="true"] {              /* 针对带有 nav="true" 属性的 QPushButton 控件设置样式 */
+            color: #e8eaed;                    /* 默认字体颜色：浅白色 */
+            background: rgba(255,255,255,0.05);/* 默认背景色：半透明白色（非常淡的浅色） */
+            border: 1px solid rgba(255,255,255,0.10); /* 默认边框：1px 实线，略微透明的浅白色 */
+            border-radius: 8px;                /* 按钮的边角设置为 8 像素圆角 */
+            text-align: left;                  /* 按钮上的文本左对齐 */
+            padding: 0 12px;                   /* 按钮内边距：上下 0，左右 12 像素 */
+        }
+
+        /* 悬停（未选中时显示白底黑字） */
+        QPushButton[nav="true"]:hover {        /* 当鼠标悬停在未选中按钮上时的样式 */
+            background: #eef3ff;               /* 悬停背景色：纯白色 */
+            color: #000000;                    /* 悬停字体颜色：黑色 */
+            border-color: #ffffff;             /* 悬停边框颜色：白色（与背景色一致） */
+        }
+
+        /* 选中：蓝底白字 + 左侧指示条；保持常驻 */
+        QPushButton[nav="true"]:checked {      /* 当按钮处于选中状态 (QAbstractButton::checked) 时的样式 */
+            background: #3b82f6;               /* 选中背景色：中等蓝色 */
+            color: #ffffff;                    /* 选中字体颜色：白色 */
+            border-color: #2f6bff;             /* 选中边框颜色：深蓝色 */
+            border-left: 4px solid #2f6bff;    /* **重点**：在左侧添加 4 像素宽的深蓝色实线指示条 */
+            padding-left: 8px;                 /* 左侧内边距调整为 8px，为左侧的指示条让出空间 */
+        }
+
+        /* 选中 + 悬停：仍保持选中样式（覆盖上面的 hover） */
+        QPushButton[nav="true"]:checked:hover { /* 当按钮处于选中状态且鼠标悬停在上面时的样式 */
+            background: #2f6bff;               /* 悬停背景色：深蓝色（比默认选中色更深，提供微小变化） */
+            color: #ffffff;                    /* 悬停字体颜色：白色 */
+            border-color: #2f6bff;             /* 悬停边框颜色：深蓝色 */
+        }
+        """)
+
+        # 互斥 + 切换页面
+        nav_group = QButtonGroup(self)
+        nav_group.setExclusive(True)
+        nav_group.addButton(self.btn_oper, 0)
+        nav_group.addButton(self.btn_about, 1)
+        self.btn_oper.setChecked(True)
+        nav_group.buttonClicked[int].connect(lambda idx: self.stack.setCurrentIndex(idx))
+
+        nav_layout.addWidget(self.btn_oper)
+        nav_layout.addWidget(self.btn_about)
+        nav_layout.addStretch(1)
+        nav_wrap.setFixedWidth(180)
+
+        # --------- 根布局：左侧导航 + 右侧栈 ----------
+        root = QHBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(10)
+        root.addWidget(nav_wrap)
+        root.addWidget(self.stack, 1)
+        self.setLayout(root)
+
+        self.setStyleSheet("""
+            QWidget { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }  /* 设置全局字体 */
+
+            QLineEdit {
+                height: 18px;  /* 输入框高度 */
+                font-size: 14px;  /* 输入框字体大小 */
+                padding: 4px 8px;  /* 输入框内边距 */
+                border: 1.5px solid #cccccc;  /* 输入框边框颜色和宽度 */
+                border-radius: 6px;  /* 输入框圆角 */
+                background-color: #ffffff;  /* 输入框背景色 */
+            }
+
+            QDateTimeEdit {
+                font-size: 20px;          /* 日期框字体大小 */
+            }
+
+            QLineEdit:focus {
+                border-color: #4a90e2;  /* 输入框聚焦时边框颜色 */
+                /* background-color: #eaf4ff;  输入框聚焦时背景色 */
+            }
+
+            QPushButton {
+                height: 36px;  /* 按钮高度 */
+                font-size: 15px;  /* 按钮字体大小 */
+                color: white;  /* 按钮文字颜色 */
+                background-color: #4a90e2;  /* 按钮背景颜色 */
+                border: none;  /* 按钮无边框 */
+                border-radius: 8px;  /* 按钮圆角 */
+                font-weight: bold;  /* 按钮文字加粗 */
+                margin-top: 10px;  /* 按钮顶部外边距 */
+            }
+
+            QPushButton:hover {
+                background-color: #357ABD;  /* 鼠标悬停时按钮背景颜色 */
+            }
+
+            QPushButton:pressed {
+                background-color: #2C5AA0;  /* 按钮按下时背景颜色 */
+            }
+
+            QPushButton:disabled {
+                background-color: #eee;  /* 禁用按钮背景色 */
+                border: 1px solid #aaa;  /* 禁用按钮边框 */
+                color: #999;  /* 禁用按钮文字颜色 */
+            }
+
+            QGroupBox {
+                border: 1px solid #aaa;  /* 组框边框颜色和宽度 */
+                border-radius: 8px;  /* 组框圆角 */
+                margin-top: 10px;  /* 组框顶部外边距 */
+            }
+
+            QGroupBox::title {
+                subcontrol-origin: margin;  /* 组框标题基于边距定位 */
+                subcontrol-position: top center;  /* 组框标题居中 */
+                padding: 0 6px;  /* 组框标题内边距 */
+                font-size: 15px;  /* 组框标题字体大小 */
+                font-weight: bold;  /* 组框标题加粗 */
+            }
+
+            QMessageBox { 
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;  /* 弹窗字体 */
+                font-size: 13px;  /* 弹窗字体大小 */
+            }
+
+            QMessageBox QPushButton {
+                min-width: 80px;  /* 弹窗按钮最小宽度 */
+                min-height: 28px;  /* 弹窗按钮最小高度 */
+                border-radius: 6px;  /* 弹窗按钮圆角 */
+                font-size: 13px;  /* 弹窗按钮字体大小 */
+                background-color: #4a90e2;  /* 弹窗按钮背景颜色 */
+                color: white;  /* 弹窗按钮文字颜色 */
+            }
+
+            QMessageBox QPushButton:hover {
+                background-color: #357ABD;  /* 弹窗按钮悬停背景颜色 */
+            }
+
+            QMessageBox QPushButton:pressed {
+                background-color: #2C5AA0;  /* 弹窗按钮按下背景颜色 */
+            }
+        """)
+
+    # 文本解析
+    def select_text_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择 文本 文件", "", "Text Files (*.txt);;All Files (*.*)")
+        if not file_path: return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            parts = re.split(r"[,\s;，；]+", content)
+            raw_ids = [p.strip() for p in parts if p.strip() != ""]
+
+            invalid_preview, valid_ids, seen = [], [], set()
+            for val in raw_ids:
+                if val.isdigit():
+                    if val not in seen: seen.add(val); valid_ids.append(val)
+                else:
+                    if len(invalid_preview) < 10: invalid_preview.append(val)
+
+            if not valid_ids:
+                QMessageBox.warning(self, "空文件", "未解析到有效的用户 ID（纯数字）。")
+                self.text_file_path = "";
+                self.user_ids = [];
+                # 重置底部状态
+                self.progress_label.setText("0 / 0")
+                self.progress_bar.setMaximum(0)
+                self.progress_bar.setValue(0)
+                return
+
+            self.text_file_path = file_path;
+            self.user_ids = valid_ids
+            msg = f"✅ 成功导入 {len(valid_ids)} 个账号"
+            if invalid_preview: msg += f"\n⚠️ 跳过非数字示例：{', '.join(invalid_preview)}"
+            QMessageBox.information(self, "导入成功", msg)
+
+            # —— 设置底部状态为 0 / N —— #
+            total = len(valid_ids)
+            self.progress_label.setText(f"0 / {total}")
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(0)
+
+        except Exception as e:
+            QMessageBox.critical(self, "读取错误", f"无法读取文本：\n{e}")
+            self.text_file_path = "";
+            self.user_ids = []
+            # 重置底部状态
+            self.progress_label.setText("0 / 0")
+            self.progress_bar.setMaximum(0)
+            self.progress_bar.setValue(0)
+
+    # 辅助 UI
+    def set_yesterday_range(self):
+        y = datetime.now() - timedelta(days=1)
+        self.start_datetime.setDateTime(QDateTime(y.replace(hour=0, minute=0, second=0, microsecond=0)))
+        self.end_datetime.setDateTime(QDateTime(y.replace(hour=23, minute=59, second=59, microsecond=0)))
+
+    def show_floating_message(self, message, duration=2200):
+        label = QLabel(message, self)
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet("""
+            QLabel { background-color:#d1f0e1; color:#1d5c49; font-size:16px;
+                     border:1px solid #a0c5b1; border-radius:8px; padding:10px; }
+        """)
+        label.resize(520, 50)
+        fw, fh = self.frameGeometry().width(), self.frameGeometry().height()
+        label.move((fw - label.width()) // 2, (fh - label.height()) // 2)
+        label.show()
+        QTimer.singleShot(duration, label.deleteLater)
+
+    # 配置
+    def save_config(self):
+        port = self.port_edit.text().strip()
+        token = self.token_edit.text().strip()
+        code = self.code_edit.text().strip()
+        if not port or not token or not code:
+            QMessageBox.warning(self, "配置错误", "请填写完整 Cookie、端口号、登录码！");
+            return
+        cfg = ConfigParser()
+        cfg['USER'] = {'Port': port, 'Token': token, 'Code': code}
+        with open('config.ini', 'w') as f: cfg.write(f)
+        QMessageBox.information(self, "提示", "✅ 配置已保存！")
+
+    def load_config(self):
+        cfg = ConfigParser();
+        cfg.read('config.ini')
+        if 'USER' in cfg:
+            self.port_edit.setText(cfg['USER'].get('Port', ''))
+            self.token_edit.setText(cfg['USER'].get('Token', ''))
+            self.code_edit.setText(cfg['USER'].get('Code', ''))
+
+    # 运行
+    def run_script(self):
+        try:
+            # 1) 先校验三个输入框
+            token = self.token_edit.text().strip()
+            port = self.port_edit.text().strip()
+            code = self.code_edit.text().strip()
+
+            if not token:
+                QMessageBox.warning(self, "缺少输入", "请先填写 Cookie（token）。")
+                self.token_edit.setFocus()
+                return
+            if not port:
+                QMessageBox.warning(self, "缺少输入", "请先填写端口号。")
+                self.port_edit.setFocus()
+                return
+            if not port.isdigit() or not (1 <= int(port) <= 65535):
+                QMessageBox.warning(self, "端口号不合法", "端口号必须是 1–65535 的数字。")
+                self.port_edit.setFocus()
+                return
+            if not code:
+                QMessageBox.warning(self, "缺少输入", "请先填写登录码。")
+                self.code_edit.setFocus()
+                return
+
+            # 2) 校验已导入ID
+            if not self.user_ids:
+                QMessageBox.warning(self, "提示", "请先导入一个TXT文本（每行一个ID，或用逗号/空格/分号分隔）。")
+                return
+
+            # 3) 读取标签规则与时间
+            tag_rules = load_tag_rules_with_fallback(self)
+            start_dt = self.start_datetime.dateTime().toPyDateTime()
+            end_dt = self.end_datetime.dateTime().toPyDateTime()
+            kssjld = int(start_dt.timestamp())
+            jssjld = int(end_dt.timestamp())
+            if kssjld > jssjld:
+                QMessageBox.warning(self, "时间范围错误", "开始时间不能大于结束时间。")
+                return
+
+            # 4) 锁定UI并启动线程
+            for w in (self.port_edit, self.token_edit, self.code_edit, self.yesterday_btn,
+                      self.choose_file_btn, self.save_btn, self.run_btn,
+                      self.start_datetime, self.end_datetime):
+                w.setEnabled(False)
+
+            # —— 启动前重置底部状态 —— #
+            total = len(self.user_ids)
+            self.progress_label.setText(f"0 / {total}")
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(0)
+
+            worker = LogFetchWorker(
+                self.user_ids, kssjld, jssjld, port, token, code,
+                tag_rules, timeout=15
+            )
+            worker.signals.progress.connect(self.on_progress)
+            worker.signals.finished.connect(self.on_task_finished)
+            worker.signals.error.connect(self.on_task_error)
+            self.thread_pool.start(worker)
+
+            self.show_floating_message("正在自动贴标签，请稍等...", duration=2600)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    # —— 进度槽函数 —— #
+    def on_progress(self, processed, total):
+        try:
+            self.progress_label.setText(f"{processed} / {total}")
+            # 使用“最大值=总数，当前值=已处理”，QProgressBar 会自动显示百分比
+            if self.progress_bar.maximum() != total:
+                self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(processed)
+        except Exception:
+            pass
+
+    def on_task_finished(self, filename):
+        try:
+            # 完成后拉满
+            if self.progress_bar.maximum() > 0:
+                self.progress_bar.setValue(self.progress_bar.maximum())
+                self.progress_label.setText(f"{self.progress_bar.maximum()} / {self.progress_bar.maximum()}")
+            if sys.platform.startswith("win"):
+                os.startfile(filename)
+        except Exception as e:
+            QMessageBox.information(self, "完成", f"✅ 数据已保存为 {filename}\n（无法自动打开：{e})")
+        for w in (self.port_edit, self.token_edit, self.code_edit,self.yesterday_btn,
+                  self.choose_file_btn, self.save_btn, self.run_btn,
+                  self.start_datetime, self.end_datetime):
+            w.setEnabled(True)
+
+    def on_task_error(self, error_message):
+        QMessageBox.critical(self, "错误", f"任务出错：\n{error_message}")
+        for w in (self.port_edit, self.token_edit, self.code_edit,
+                  self.choose_file_btn, self.save_btn, self.run_btn,
+                  self.start_datetime, self.end_datetime):
+            w.setEnabled(True)
+
+
+# =========================
+#  入口
+# =========================
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = GameLogApp()
+    window.show()
+    sys.exit(app.exec_())
