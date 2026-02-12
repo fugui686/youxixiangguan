@@ -1,0 +1,378 @@
+import openpyxl
+import requests
+import os
+import tkinter as tk
+from tkinter import messagebox
+from datetime import datetime, timedelta
+from openpyxl import Workbook
+from configparser import ConfigParser
+
+dqsj = datetime.now()
+zr = dqsj - timedelta(days=1)
+qt = dqsj - timedelta(days=2)
+zrld = zr.strftime('%Y-%m-%d 00:00:00')
+jrld = dqsj.strftime('%Y-%m-%d 00:00:00')
+qtld = qt.strftime('%Y%m%d')
+gshzrld = int(datetime.strptime(zrld, "%Y-%m-%d %H:%M:%S").timestamp())
+gshjrld = int(datetime.strptime(jrld, "%Y-%m-%d %H:%M:%S").timestamp())
+
+# 函数：保存配置到文件
+def save_config(ht, port, token, code):
+    config = ConfigParser()
+    config['USER'] = {'Merchants': ht,
+                      'Port': port,
+                      'Token': token,
+                      'Code': code}
+    with open('config.ini', 'w') as configfile:
+        config.write(configfile)
+
+# 函数：从文件加载配置
+def load_config():
+    config = ConfigParser()
+    config.read('config.ini')
+    if 'USER' in config:
+        return config['USER']['Merchants'], config['USER']['Port'], config['USER']['Token'], config['USER']['Code']
+    else:
+        return '', '', '', ''
+
+def run_script():
+    try:
+        ht = entry_Merchants.get()
+        token = entry_password.get()
+        port = entry_port.get()
+        code = entry_code.get()
+        headers = {
+            'Cookie': f'token={token}',
+        }
+
+        # 返利结算
+        base_url = f"http://{ht}.boinht.com:{port}/pp_fs_finally_report/get_report_user_list"
+
+        page = 1  # 修改为您需要获取的起始页数
+        total_pages = 500  # 修改为总页数  280*20=5600页
+
+        # 打开Excel文件
+        wb = Workbook()
+        ws = wb.active
+
+        ws.title = '彩金核对'
+
+        ws.append(['归属部门', '会员账号', '彩金名称', '彩金金额'])
+
+        # 从第一页开始逐页获取数据
+        for current_page in range(page, total_pages + 1):
+            data = {
+                "user_ids": "",
+                "report_date": qtld,
+                "page": current_page,
+                "app_id": "live3",
+                "tree_path": "/live3/lvcha/",
+                "login_code": code,
+            }
+
+            # 发送请求
+            response = requests.post(base_url, data=data, headers=headers)
+
+            if response.status_code == 200:
+                data = response.json().get('result')
+
+                if not data:  # 如果返回的数据为空，则跳出循环
+                    break
+
+                start_row = ws.max_row + 1
+
+                for row_idx, dd in enumerate(data, start=start_row):
+                    返利结算账号 = dd.get('user_id')
+                    返利结算名称 = '返水'
+                    游戏返利金额 = dd.get('game_income')
+                    直播返利金额 = dd.get('live_income')
+                    返利金额 = 游戏返利金额 + 直播返利金额
+
+                    ws.cell(row=row_idx, column=1).value = ht
+                    ws.cell(row=row_idx, column=2).value = 返利结算账号
+                    ws.cell(row=row_idx, column=3).value = 返利结算名称
+                    ws.cell(row=row_idx, column=4).value = 返利金额
+            else:
+                print(f"Failed to fetch data from {base_url}. Status code: {response.status_code}")
+
+        # 保存Excel文件
+        wb.save(f'{ht}彩金_核对.xlsx')
+
+        # 新活动领取
+        baseurl = f"http://{ht}.boinht.com:{port}/campaign/activity_log"
+
+        page = 1  # 修改为您需要获取的起始页数
+        total_pages = 20  # 修改为总页数  10*200=2000页
+
+        # 打开Excel文件
+        wb = openpyxl.load_workbook(f'{ht}彩金_核对.xlsx')
+        ws = wb.active
+
+        # 从第一页开始逐页获取数据
+        for current_page in range(page, total_pages + 1):
+            data = {
+                "page_size": 200,
+                "begin_time": gshzrld,
+                "end_time": gshjrld,
+                "page": current_page,
+                "type": "0",
+                "login_code": code,
+            }
+
+            # 发送请求
+            response = requests.post(baseurl, data=data, headers=headers)
+
+            if response.status_code == 200:
+                try:
+                    data = response.json()['result']
+
+                    if not data:  # 如果返回的数据为空，则跳出循环
+                        break
+
+                    start_row = ws.max_row + 1
+
+                    for row_idx, dd in enumerate(data, start=start_row):
+                        新活动领取账号 = dd.get('platform_user_id')
+                        新活动领取名称 = dd.get('campaign_title')
+                        新活动领取金额 = dd.get('quantity')
+
+                        ws.cell(row=row_idx, column=1).value = ht
+                        ws.cell(row=row_idx, column=2).value = 新活动领取账号
+                        ws.cell(row=row_idx, column=3).value = 新活动领取名称
+                        ws.cell(row=row_idx, column=4).value = 新活动领取金额
+
+                except KeyError:
+                    print(f"Error: No 'result' found in JSON response for page {current_page}")
+
+            else:
+                print(f"Error: Request failed with status code {response.status_code} for page {current_page}")
+
+        # 保存Excel文件
+        wb.save(f'{ht}彩金_核对.xlsx')
+
+        # 首存返利
+        base_url = f"http://{ht}.boinht.com:{port}/pp_activity_log/pf_list"
+
+        page = 1  # 修改为您需要获取的起始页数
+        total_pages = 20  # 修改为总页数  10*200=2000页
+
+        # 打开Excel文件
+        wb = openpyxl.load_workbook(f'{ht}彩金_核对.xlsx')
+        ws = wb.active
+
+        # 从第一页开始逐页获取数据
+        for current_page in range(page, total_pages + 1):
+            data = {
+                "begin_time": gshzrld,
+                "end_time": gshjrld,
+                "page": current_page,
+                "login_code": code,
+            }
+
+            # 发送请求
+            response = requests.post(base_url, data=data, headers=headers)
+
+            if response.status_code == 200:
+                try:
+                    data = response.json()['result']
+
+                    if not data:  # 如果返回的数据为空，则跳出循环
+                        break
+
+                    start_row = ws.max_row + 1
+
+                    for row_idx, dd in enumerate(data, start=start_row):
+                        首存返利账号 = dd.get('user_id')
+                        首存返利名称 = '首存返利'
+                        首存返利金额 = dd.get('money')
+
+                        ws.cell(row=row_idx, column=1).value = ht
+                        ws.cell(row=row_idx, column=2).value = 首存返利账号
+                        ws.cell(row=row_idx, column=3).value = 首存返利名称
+                        ws.cell(row=row_idx, column=4).value = 首存返利金额
+
+                except KeyError:
+                    print(f"Error: No 'result' found in JSON response for page {current_page}")
+
+            else:
+                print(f"Error: Request failed with status code {response.status_code} for page {current_page}")
+
+        # 保存Excel文件
+        wb.save(f'{ht}彩金_核对.xlsx')
+
+        # 美人桥入款优惠
+        url = f"http://{ht}.boinht.com:{port}/payment_log/list_payment_log"  #
+
+        # 打开Excel文件
+        wb = openpyxl.load_workbook(f'{ht}彩金_核对.xlsx')
+        ws = wb.active
+
+        data = {
+            'page_size': 99999,
+            'page': 1,
+            'is_pay': '1',
+            'send_item_time': '1',
+            'begin_time': gshzrld,
+            'end_time': gshjrld,
+            'is_first_recharge': 0,
+            'payment_class_id': 999,
+            'money_type': 1,
+            "login_code": code,
+        }
+
+        response = requests.post(url, data=data, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['result']
+
+            start_row = ws.max_row + 1
+
+            for row_idx, dd in enumerate(data, start=start_row):
+                美人桥充值账号 = dd.get('user_id')
+                支付方式 = '美人桥入款优惠'
+                美人桥充值金额 = dd.get('money')
+                美人桥入款优惠金额 = 美人桥充值金额 * 0.02
+
+                ws.cell(row=row_idx, column=1).value = ht
+                ws.cell(row=row_idx, column=2).value = 美人桥充值账号
+                ws.cell(row=row_idx, column=3).value = 支付方式
+                ws.cell(row=row_idx, column=4).value = 美人桥入款优惠金额
+
+        wb.save(f'{ht}彩金_核对.xlsx')
+
+        # 充值明细 后台充值
+        url = f"http://{ht}.boinht.com:{port}/payment_log/list_payment_log"
+
+        # 打开Excel文件
+        wb = openpyxl.load_workbook(f'{ht}彩金_核对.xlsx')
+        ws = wb.active
+
+        data = {
+            "page_size": 99999,
+            "page": 1,
+            "is_pay": "1",
+            "send_item_time": "1",
+            "begin_time": gshzrld,
+            "end_time": gshjrld,
+            "is_first_recharge": 0,
+            "payment_class_id": 777,
+            "money_type": 1,
+            "min_money": "",
+            "max_money": "",
+            "login_code": code,
+        }
+
+        response = requests.post(url, data=data, headers=headers)
+
+        if response.status_code == 200:
+            data = response.json().get('result', [])
+
+            for dd in data:
+                if dd['content'] == '支付宝固码':
+                    continue  # 如果是支付宝固码，则跳过当前循环，不处理该条数据
+                if dd['content'] == '固码支付宝':
+                    continue  # 如果是固码支付宝，则跳过当前循环，不处理该条数据
+
+                后台充值账号 = dd.get('user_id')
+                后台备注名称 = dd.get('content')
+                if '重' in 后台备注名称:
+                    continue
+
+                if '清' in 后台备注名称:
+                    continue
+
+                if '丢失' in 后台备注名称:
+                    continue
+
+                if '超时' in 后台备注名称:
+                    continue
+
+                if '订单号' in 后台备注名称:
+                    continue
+
+                if '掉单' in 后台备注名称:
+                    continue
+
+                if '盈利提出' in 后台备注名称:
+                    continue
+
+                if '误存' in 后台备注名称:
+                    continue
+
+                后台充值总金额 = dd.get('item_count')
+                后台充值金额 = dd.get('money')
+                赠送金额 = 后台充值总金额 - 后台充值金额
+
+                # 写入数据到 Excel 表格
+                row_idx = ws.max_row + 1
+                ws.cell(row=row_idx, column=1).value = ht
+                ws.cell(row=row_idx, column=2).value = 后台充值账号
+                ws.cell(row=row_idx, column=3).value = 后台备注名称
+                ws.cell(row=row_idx, column=4).value = 赠送金额
+
+        # 保存和打开 Excel 文件
+        wb.save(f'{ht}彩金_核对.xlsx')
+        os.startfile(f'{ht}彩金_核对.xlsx')
+
+    except Exception as e:
+        messagebox.showerror("错误", str(e))
+
+# 函数：手动保存配置
+def manual_save():
+    ht = entry_Merchants.get()
+    port = entry_port.get()
+    token = entry_password.get()
+    code = entry_code.get()
+
+    save_config(ht, port, token, code)
+    messagebox.showinfo("提示", "配置已保存！")
+
+# 创建主窗口
+root = tk.Tk()
+root.title("直播彩金核对_通用版")
+root.geometry("330x250")  # 设置窗口大小
+
+# 设置字体
+font_style = ("Helvetica", 12)
+font_styl = ("Helvetica", 18)
+
+# 如果存在配置文件则加载配置
+ht, port, token, code = load_config()
+
+# 创建标签和输入框
+label_Merchants = tk.Label(root, text="输入后台:", font=font_style)
+label_Merchants.grid(row=0, column=0, padx=10, pady=5, sticky='e')
+
+entry_Merchants = tk.Entry(root, font=font_style)
+entry_Merchants.grid(row=0, column=1, padx=10, pady=5)
+entry_Merchants.insert(0, ht)  # 插入加载的值
+
+label_password = tk.Label(root, text="输入密码:", font=font_style)
+label_password.grid(row=1, column=0, padx=10, pady=5, sticky='e')
+
+entry_password = tk.Entry(root, font=font_style)
+entry_password.grid(row=1, column=1, padx=10, pady=5)
+entry_password.insert(0, token)  # 插入加载的值
+
+label_port = tk.Label(root, text="输入端口:", font=font_style)
+label_port.grid(row=2, column=0, padx=10, pady=5, sticky='e')
+
+entry_port = tk.Entry(root, font=font_style)
+entry_port.grid(row=2, column=1, padx=10, pady=5)
+entry_port.insert(0, port)  # 插入加载的值
+
+label_code = tk.Label(root, text="小明登录码:", font=font_style)
+label_code.grid(row=3, column=0, padx=10, pady=5, sticky='e')
+
+entry_code = tk.Entry(root, font=font_style)
+entry_code.grid(row=3, column=1, padx=10, pady=5)
+entry_code.insert(0, code)  # 插入加载的值
+
+# 创建手动保存按钮
+save_button = tk.Button(root, text="手动保存", command=manual_save, font=font_style)
+save_button.grid(row=4, columnspan=2, pady=5)
+
+submit_button = tk.Button(root, text="点击获取", command=run_script, font=font_styl, fg='red')
+submit_button.grid(row=5, columnspan=2, pady=5)
+
+# 运行主循环
+root.mainloop()
