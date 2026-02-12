@@ -1,0 +1,353 @@
+import sys
+import os
+import time
+from configparser import ConfigParser
+import requests
+from openpyxl import Workbook
+from datetime import datetime
+from PyQt5.QtGui import QFont
+from PyQt5.QtCore import QThreadPool, QDateTime, QTime, QDate, QRunnable, pyqtSignal, QObject, QMutex
+from PyQt5.QtWidgets import QApplication, QMessageBox, QDateTimeEdit, QTabWidget, QWidget, QVBoxLayout, \
+    QLineEdit, QPushButton
+
+
+# 创建一个信号发送对象类
+class WorkerSignals(QObject):
+    finished = pyqtSignal(str)  # 传递任务状态
+    data_ready = pyqtSignal(list)  # 传递数据
+
+
+# 子线程工作类
+class DataWorker(QRunnable):
+    def __init__(self, ht, port, token, code, zjm, flzq, sh, ys, signals):
+        super().__init__()
+        self.ht = ht
+        self.port = port
+        self.code = code
+        self.token = token
+        self.zjm = zjm
+        self.flzq = flzq
+        self.sh = sh
+        self.ys = ys
+        self.signals = signals  # 信号对象
+        self.recharge_data = []  # 用于存储返利结算明细数据
+
+    def run(self):
+        try:
+            headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Encoding': 'gzip, deflate',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': f'token={self.token}',
+                'Host': f'{self.ht}.boinht.com:{self.port}',
+                'Origin': f'http://{self.ht}.boinht.com:{self.port}',
+                'Referer': f'http://{self.ht}.boinht.com:{self.port}/admin.html',
+                'User-Agent': self.zjm,
+            }
+
+            # 构建请求 URL
+            url = f"http://{self.ht}.boinht.com:{self.port}/pp_fs_finally_report/get_report_user_list"
+
+            # 打开Excel文件
+            wb = Workbook()
+            ws = wb.active
+
+            ws.append(['归属部门', '会员账号', '彩金名称', '彩金金额', '状态'])
+
+            # 设置请求数据的基础部分
+            data = {
+                'user_ids': '',
+                'report_date': self.flzq,
+                'app_id': 'live3',
+                'tree_path': f'/live3/{self.sh}/',
+                "login_code": self.code,
+            }
+
+            # 将 total_pages 设置为字符串类型
+            total_paqqyses = f'{self.ys}'
+
+            # 将 total_pages 转换为整数
+            total_pages = int(total_paqqyses)  # 这里将字符串转换为整数 # 例如：获取前5页数据
+
+            max_retries = 10  # 最大请求次数
+
+            # 循环获取每一页的数据
+            for page in range(1, total_pages + 1):
+                data['page'] = page  # 更新当前页数
+                retries = 0  # 重试计数器
+
+                while retries < max_retries:
+                    response = requests.post(url, data=data, headers=headers)
+                    if response.status_code == 200:
+                        result_data = response.json().get('result', [])
+                        for aa in result_data:
+                            返利结算账号 = aa.get('user_id')
+                            返利结算名称 = '返水'
+                            游戏返利金额 = aa.get('game_income', 0)  # 确保金额为0
+                            直播返利金额 = aa.get('live_income', 0)  # 确保金额为0
+                            返利金额 = 游戏返利金额 + 直播返利金额
+                            状态 = aa.get('send_status')
+                            if 状态 == 0:
+                                状态 = '未发放'
+                            if 状态 == 1:
+                                状态 = '已发放'
+                            if 状态 == 2:
+                                状态 = '拒绝'
+
+                            # 将数据存储在列表中
+                            self.recharge_data.append({
+                                '归属部门': self.ht,
+                                '会员账号': 返利结算账号,
+                                '彩金名称': 返利结算名称,
+                                '彩金金额': 返利金额,
+                                '状态': 状态,
+                            })
+
+                        break  # 成功获取数据后退出重试循环
+                    else:
+                        print(f"请求失败，状态码：{response.status_code}，正在重试第 {retries + 1} 次...")
+                        retries += 1
+                        time.sleep(5)  # 暂停5秒后重试
+
+                if retries == max_retries:
+                    print(f"第 {page} 页请求失败，已超过最大请求次数，跳过该页。")
+
+            # 发出任务完成信号
+            self.signals.finished.emit(f"所有数据已获取完成！")
+            # 传递充值明细数据
+            self.signals.data_ready.emit(self.recharge_data)
+
+        except Exception as e:
+            self.signals.finished.emit(f"发生错误: {e}")
+
+
+class UserWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        # 设置允许使用的截止时间 (YYYY-MM-DD HH:MM:SS)
+        self.expiration_date_str = "2027-04-22 23:59:59"  # 软件过期时间
+        self.expiration_date = datetime.strptime(self.expiration_date_str, "%Y-%m-%d %H:%M:%S")
+
+        # 检查是否需要提醒
+        remaining_days = self.get_remaining_days()
+        if remaining_days > 0 and remaining_days <= 7:
+            QMessageBox.warning(self, "软件即将更新", f"本软件将在{remaining_days}天后自动更新：\n请联系《富贵》获取最新版本。")
+
+        # 检查是否过期
+        if self.is_expired():
+            QMessageBox.critical(self, "软件已更新", f"你的应用版本过低：\n请联系《富贵》获取最新版本。")
+            sys.exit(0)  # 退出程序
+
+        self.setWindowTitle("返利结算_版本20250222")
+        self.setGeometry(700, 100, 500, 700)
+
+        # 创建一个标签页
+        self.tab_widget = QTabWidget(self)
+
+        # 配置标签
+        self.config_tab = QWidget()
+        self.setup_config_tab()
+
+        # 数据处理标签
+        self.data_tab = QWidget()
+        self.setup_data_tab()
+
+        self.tab_widget.addTab(self.data_tab, "首页")
+        self.tab_widget.addTab(self.config_tab, "设置")
+        self.tab_widget.setFont(QFont("Arial", 15))
+
+        # 主布局
+        layout = QVBoxLayout()
+        layout.addWidget(self.tab_widget)
+        self.setLayout(layout)
+
+        # 创建线程池
+        self.thread_pool = QThreadPool()
+
+        # 加载配置
+        self.load_config()
+
+        self.recharge_data = []  # 用于存储返利结算明细数据
+        self.workers = []  # 用于存储所有的工作线程
+
+    def is_expired(self):
+        """检查当前时间是否超过指定的截止时间"""
+        current_time = datetime.now()  # 获取当前系统时间
+        return current_time > self.expiration_date
+
+    def get_remaining_days(self):
+        """计算距离过期时间还有多少天"""
+        current_time = datetime.now()  # 获取当前系统时间
+        days_left = (self.expiration_date - current_time).days  # 计算剩余天数
+        return days_left  # 返回剩余的天数
+
+    def setup_data_tab(self):
+        layout = QVBoxLayout()
+
+        self.srk_flzq = QLineEdit(self)
+        self.srk_flzq.setPlaceholderText("返利周期")
+        self.srk_flzq.setFixedHeight(40)
+        layout.addWidget(self.srk_flzq)
+
+        self.srk_sh = QLineEdit(self)
+        self.srk_sh.setPlaceholderText("商户")
+        self.srk_sh.setFixedHeight(40)
+        layout.addWidget(self.srk_sh)
+
+        self.srk_ys = QLineEdit(self)
+        self.srk_ys.setPlaceholderText("页数")
+        self.srk_ys.setFixedHeight(40)
+        layout.addWidget(self.srk_ys)
+
+        # 获取数据按钮
+        self.get_button = QPushButton("获取数据")
+        self.get_button.clicked.connect(self.start_processing)
+        layout.addWidget(self.get_button)
+
+        # 导出数据按钮
+        self.export_button = QPushButton("导出数据")
+        self.export_button.clicked.connect(self.export_data)
+        layout.addWidget(self.export_button)
+
+        self.data_tab.setLayout(layout)
+
+    def setup_config_tab(self):
+        layout = QVBoxLayout()
+
+        self.srk_ht = QLineEdit(self)
+        self.srk_ht.setPlaceholderText("后台")
+        self.srk_ht.setFixedHeight(40)
+        layout.addWidget(self.srk_ht)
+
+        self.srk_port = QLineEdit(self)
+        self.srk_port.setPlaceholderText("port")
+        self.srk_port.setFixedHeight(40)
+        layout.addWidget(self.srk_port)
+
+        self.srk_token = QLineEdit(self)
+        self.srk_token.setPlaceholderText("Cookie")
+        self.srk_token.setFixedHeight(40)
+        layout.addWidget(self.srk_token)
+
+        self.srk_code = QLineEdit(self)
+        self.srk_code.setPlaceholderText("小明登录码")
+        self.srk_code.setFixedHeight(40)
+        layout.addWidget(self.srk_code)
+
+        self.srk_zjm = QLineEdit(self)
+        self.srk_zjm.setPlaceholderText("User-Agent")
+        self.srk_zjm.setFixedHeight(40)
+        layout.addWidget(self.srk_zjm)
+
+        self.save_button = QPushButton("保存配置")
+        self.save_button.clicked.connect(self.manual_save)
+        layout.addWidget(self.save_button)
+
+        self.config_tab.setLayout(layout)
+
+    def start_processing(self):
+        try:
+            ht = self.srk_ht.text()
+            port = self.srk_port.text()
+            token = self.srk_token.text()
+            code = self.srk_code.text()
+            zjm = self.srk_zjm.text()
+            flzq = self.srk_flzq.text()
+            sh = self.srk_sh.text()
+            ys = self.srk_ys.text()
+            print(ht, port, token, code, zjm, flzq, sh, ys)
+
+            # 创建信号对象
+            signals = WorkerSignals()
+
+            # 创建子线程来获取数据
+            worker = DataWorker(ht, port, token, code, zjm, flzq, sh, ys, signals)
+            self.workers.append(worker)  # 将工作线程添加到列表中
+            signals.finished.connect(self.on_task_finished)
+            signals.data_ready.connect(self.on_data_ready)  # 连接数据准备信号
+
+            # 将任务提交到线程池
+            self.thread_pool.start(worker)
+
+            self.srk_flzq.setEnabled(False)  # 禁用开始时间
+            self.srk_sh.setEnabled(False)  # 禁用结束按钮
+            self.srk_ys.setEnabled(False)  # 禁用结束按钮
+            self.get_button.setEnabled(False)  # 禁用获取按钮
+            self.export_button.setEnabled(False)  # 禁用导出按钮
+
+        except Exception as e:
+            print(f"发生错误: {e}")
+
+    def on_task_finished(self, message):
+        QMessageBox.information(self, "提示", message)
+
+    def on_data_ready(self, recharge_data):
+        self.recharge_data = recharge_data  # 存储充值明细数据
+        self.srk_flzq.setEnabled(True)  # 启用开始时间
+        self.srk_sh.setEnabled(True)  # 启用结束按钮
+        self.srk_ys.setEnabled(True)  # 启用结束按钮
+        self.get_button.setEnabled(True)  # 启用获取按钮
+        self.export_button.setEnabled(True)  # 启用导出按钮
+
+    def export_data(self):
+        if not self.recharge_data:
+            QMessageBox.warning(self, "警告", "没有数据可导出！")
+            return
+
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.append(['归属部门', '会员账号', '彩金名称', '彩金金额', '状态'])
+
+            for record in self.recharge_data:
+                ws.append([record['归属部门'], record['会员账号'], record['彩金名称'], record['彩金金额'], record['状态']])
+
+            # 保存Excel文件
+            rq = datetime.now().strftime('%Y年%m月%d日%H时%M分%S秒')
+
+            file_name = f'导出数据_{rq}.xlsx'
+            wb.save(file_name)
+
+            QMessageBox.information(self, "提示", f"数据已导出到 {file_name}")
+            os.startfile(file_name)  # 打开导出的文件
+
+        except Exception as e:
+            QMessageBox.warning(self, "警告", f"导出数据失败: {e}")
+
+    def save_config(self, ht, port, token, code, zjm):  # 保存配置到文件
+        config = ConfigParser()
+        config['USER'] = {'ht': ht, 'Port': port, 'Token': token, 'Code': code, 'zjm': zjm}
+        with open('config.ini', 'w') as configfile:
+            config.write(configfile)
+
+    def load_config(self):  # 从文件加载配置
+        config = ConfigParser()
+        config.read('config.ini')
+        if 'USER' in config:
+            self.srk_ht.setText(config['USER']['ht'])
+            self.srk_port.setText(config['USER']['port'])
+            self.srk_token.setText(config['USER']['Token'])
+            self.srk_code.setText(config['USER']['Code'])
+            self.srk_zjm.setText(config['USER']['zjm'])
+
+    def manual_save(self):  # 手动保存函数
+        ht = self.srk_ht.text()
+        port = self.srk_port.text()
+        token = self.srk_token.text()
+        code = self.srk_code.text()
+        zjm = self.srk_zjm.text()
+        if ht and port and token and code and zjm:
+            self.save_config(ht, port, token, code, zjm)
+            QMessageBox.information(self, "提示", "配置已保存！")
+        else:
+            QMessageBox.warning(self, "警告", "请填写完整的配置！")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = UserWindow()
+    window.show()
+    sys.exit(app.exec_())
