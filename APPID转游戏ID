@@ -1,0 +1,347 @@
+import sys
+import os
+import time
+import random
+import requests
+from openpyxl import Workbook
+from datetime import datetime
+from PyQt5.QtGui import QFont
+from configparser import ConfigParser
+from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog, QDateTimeEdit, QTabWidget
+from PyQt5.QtCore import QStandardPaths
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLineEdit, QPushButton
+
+
+class UserWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        # 设置允许使用的截止时间 (YYYY-MM-DD HH:MM:SS)
+        self.expiration_date_str = "2028-04-10 23:59:59"  # 软件过期时间
+        self.expiration_date = datetime.strptime(self.expiration_date_str, "%Y-%m-%d %H:%M:%S")
+
+        # 检查是否需要提醒
+        remaining_days = self.get_remaining_days()
+        if remaining_days > 0 and remaining_days <= 7:
+            QMessageBox.warning(self, "软件即将到期", f"本软件将在{remaining_days}天后到期：\n请联系《富贵》获取最新版本。")
+
+        # 检查是否过期
+        if self.is_expired():
+            QMessageBox.critical(self, "软件已过期", f"本软件的使用期限已过期：\n请联系《富贵》获取最新版本。")
+            sys.exit(0)  # 退出程序
+
+        self.setWindowTitle("APPID转游戏ID__版本20250428")
+        self.setGeometry(700, 100, 500, 700)
+
+        # 创建一个标签页
+        self.tab_widget = QTabWidget(self)
+
+        # 配置标签
+        self.config_tab = QWidget()
+        self.setup_config_tab()
+
+        # 数据处理标签
+        self.data_tab = QWidget()
+        self.setup_data_tab()
+
+        self.tab_widget.addTab(self.data_tab, "首页")
+        self.tab_widget.addTab(self.config_tab, "设置")
+        self.tab_widget.setFont(QFont("Arial", 15))
+
+        # 主布局
+        layout = QVBoxLayout()
+        layout.addWidget(self.tab_widget)
+        self.setLayout(layout)
+
+        self.completed_tasks = []
+        self.user_ids = []
+
+        # 加载配置
+        self.load_config()
+
+    def is_expired(self):
+        """检查当前时间是否超过指定的截止时间"""
+        current_time = datetime.now()  # 获取当前系统时间
+        return current_time > self.expiration_date
+
+    def get_remaining_days(self):
+        """计算距离过期时间还有多少天"""
+        current_time = datetime.now()  # 获取当前系统时间
+        days_left = (self.expiration_date - current_time).days  # 计算剩余天数
+        return days_left  # 返回剩余的天数
+
+    def setup_data_tab(self):
+        layout = QVBoxLayout()
+
+        self.file_button = QPushButton("选择文件")
+        self.file_button.clicked.connect(self.select_file)
+        layout.addWidget(self.file_button)
+
+        self.start_button = QPushButton("开始转换")
+        self.start_button.clicked.connect(self.start_processing)
+        self.start_button.setEnabled(False)
+        layout.addWidget(self.start_button)
+
+        self.export_button = QPushButton("导出数据")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_data)
+        layout.addWidget(self.export_button)
+
+        self.data_tab.setLayout(layout)
+
+    def setup_config_tab(self):
+        layout = QVBoxLayout()
+
+        self.srk_ht = QLineEdit(self)
+        self.srk_ht.setPlaceholderText("后台")
+        self.srk_ht.setFixedHeight(40)
+        layout.addWidget(self.srk_ht)
+
+        self.srk_port = QLineEdit(self)
+        self.srk_port.setPlaceholderText("port")
+        self.srk_port.setFixedHeight(40)
+        layout.addWidget(self.srk_port)
+
+        self.srk_token = QLineEdit(self)
+        self.srk_token.setPlaceholderText("Cookie")
+        self.srk_token.setFixedHeight(40)
+        layout.addWidget(self.srk_token)
+
+        self.srk_code = QLineEdit(self)
+        self.srk_code.setPlaceholderText("小明登录码")
+        self.srk_code.setFixedHeight(40)
+        layout.addWidget(self.srk_code)
+
+        self.srk_zjm = QLineEdit(self)
+        self.srk_zjm.setPlaceholderText("User-Agent")
+        self.srk_zjm.setFixedHeight(40)
+        layout.addWidget(self.srk_zjm)
+
+        self.save_button = QPushButton("保存配置")
+        self.save_button.clicked.connect(self.manual_save)
+        layout.addWidget(self.save_button)
+
+        self.config_tab.setLayout(layout)
+
+    def select_file(self):
+        desktop_path = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)  # 获取桌面路径
+        file_name, _ = QFileDialog.getOpenFileName(self, "选择用户ID文件", desktop_path,
+                                                   "Text Files (*.txt);;All Files (*)")
+        if file_name:
+            error_lines = []  # 用于记录包含非数字字符的行号
+            self.user_ids = []  # 清空之前的用户ID列表
+
+            try:
+                with open(file_name, 'r', encoding='utf-8') as file:  # 使用utf-8编码打开文件
+                    for line_number, line in enumerate(file, start=1):  # 逐行读取文件
+                        line = line.strip()  # 去除空白字符
+                        if line:  # 如果行不为空
+                            if line.isdigit():  # 检查是否为纯数字
+                                self.user_ids.append(line)  # 如果是数字，添加到用户ID列表
+                            else:
+                                error_lines.append(line_number)  # 记录错误行号
+
+                if error_lines:
+                    # 如果有错误行，提示用户
+                    error_message = f"文件中有非数字字符，错误行号：{', '.join(map(str, error_lines))}"
+                    QMessageBox.warning(self, "错误", error_message)
+                else:
+                    # 如果没有错误，提示加载成功
+                    QMessageBox.information(self, "提示", f"已加载 {len(self.user_ids)} 个用户ID！")
+                    self.start_button.setEnabled(True)
+
+            except UnicodeDecodeError:
+                # 如果文件编码错误，提示用户
+                QMessageBox.warning(self, "错误", "文件编码错误，请确保文件使用UTF-8编码！")
+
+    def closeEvent(self, event):
+        """窗口关闭时直接退出程序"""
+        sys.exit(0)
+
+    def start_processing(self):
+        self.completed_tasks = []  # 初始化已完成任务列表
+        # 获取界面输入的参数
+        ht = self.srk_ht.text()  # 主机头
+        port = self.srk_port.text()  # 端口号
+        code = self.srk_code.text()  # 登录代码
+        token = self.srk_token.text()  # 令牌
+        zjm = self.srk_zjm.text()  # 用户代理
+
+        # 检查必填字段
+        if not ht or not port or not code or not token:
+            QMessageBox.warning(self, "输入错误", "请确保所有配置输入框都已填写！")
+            return
+
+        # 禁用按钮防止重复操作
+        self.file_button.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+
+        # 设置请求头
+        headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Encoding': 'gzip, deflate',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Connection': 'keep-alive',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Cookie': f'token={token}',
+            'Host': f'{ht}.boinht.com:{port}',
+            'Origin': f'http://{ht}.boinht.com:{port}',
+            'Referer': f'http://{ht}.boinht.com:{port}/admin.html',
+            'User-Agent': zjm,
+        }
+
+        url = f"http://{ht}.boinht.com:{port}/user/get_user_game_data_by_app_userid"
+
+        # 遍历所有用户ID
+        for user_id in self.user_ids:
+            # 如果窗口已关闭则停止处理
+            if not self.isVisible():
+                return
+
+            # 准备请求数据
+            data = {
+                "user_id": user_id,
+                "login_code": code,
+            }
+
+            max_retries = 5
+            retry_count = 0
+            success = False
+
+            while retry_count < max_retries and not success:
+                # 关键修改：使用 random.uniform(0.8, 1.0) 生成随机延迟
+                delay = random.uniform(0.8, 1.0)  # 生成 0.8~1.0 之间的随机浮点数
+                # print(f"用户ID {user_id} 等待 {delay:.2f} 秒...")
+                time.sleep(delay)  # 随机等待
+
+                try:
+                    # 发送请求
+                    response = requests.post(url, data=data, headers=headers)
+
+                    # 处理成功响应
+                    if response.status_code == 200:
+                        response_json = response.json()
+                        # 检查是否有有效数据
+                        if response_json.get('code') != 0 or (
+                                isinstance(response_json.get('result'), dict) and not response_json.get('result')):
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                print(f"用户ID {user_id} 无数据，正在重试 ({retry_count}/{max_retries})...")
+                                continue
+                            else:
+                                output = f"{user_id}, 无数据"
+                                print(output)
+                                self.completed_tasks.append(output)
+                                break
+
+                        response_data = response_json.get('result', [])
+                        # 确保response_data是列表类型
+                        if isinstance(response_data, dict):
+                            response_data = [response_data] if response_data else []
+
+                        if not response_data:
+                            output = f"{user_id}, 无数据"
+                            print(output)
+                            self.completed_tasks.append(output)
+                        else:
+                            for aa in response_data:
+                                app_user_id = aa.get('app_user_id')
+                                游戏id = aa.get('id')
+                                output = f"{app_user_id}, {游戏id}"
+                                print(output)
+                                self.completed_tasks.append(output)
+                        success = True
+
+                    else:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            print(f"请求失败，状态码 {response.status_code}，正在重试 ({retry_count}/{max_retries})...")
+                        else:
+                            output = f"{user_id}, 请求失败(状态码:{response.status_code})"
+                            print(output)
+                            self.completed_tasks.append(output)
+
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        print(f"请求异常: {str(e)}，正在重试 ({retry_count}/{max_retries})...")
+                    else:
+                        output = f"{user_id}, 请求异常({str(e)})"
+                        print(output)
+                        self.completed_tasks.append(output)
+
+            # 保持UI响应
+            QApplication.processEvents()
+
+        # 完成提示
+        QMessageBox.information(self, "提示", "所有数据已获取完成！")
+        # 重新启用按钮
+        self.file_button.setEnabled(True)
+        self.start_button.setEnabled(True)
+        self.export_button.setEnabled(True)
+
+    def export_data(self):
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.append(['APPID', '游戏ID'])
+
+            for task in self.completed_tasks:
+                parts = task.split(", ")
+                user_id = parts[0]
+                phone_number = parts[1] if len(parts) > 1 else "无数据"
+                ws.append([user_id, phone_number])
+
+            # 使用当前时间作为文件名
+            current_time = datetime.now().strftime("%Y年%m月%d日%H时%M分%S秒")
+            filename = f"用户数据_{current_time}.xlsx"
+            wb.save(filename)
+            QMessageBox.information(self, "提示", f"数据已导出到 {filename}")
+
+            # 打开生成的 Excel 文件
+            os.startfile(filename)
+
+        except Exception as e:
+            QMessageBox.critical(self, "导出错误", f"导出数据时发生错误: {str(e)}")
+
+    def convert_to_number(self, value):
+        try:
+            return float(value)  # 尝试将值转换为浮点数
+        except ValueError:
+            return "无数据"  # 转换失败时返回"无数据"
+
+    def save_config(self, ht, port, token, code, zjm):  # 保存配置到文件
+        config = ConfigParser()
+        config['USER'] = {'ht': ht, 'Port': port, 'Token': token, 'Code': code, 'zjm': zjm}
+        with open('config.ini', 'w') as configfile:
+            config.write(configfile)
+
+    def load_config(self):  # 从文件加载配置
+        config = ConfigParser()
+        config.read('config.ini')
+        if 'USER' in config:
+            self.srk_ht.setText(config['USER']['ht'])
+            self.srk_port.setText(config['USER']['port'])
+            self.srk_token.setText(config['USER']['Token'])
+            self.srk_code.setText(config['USER']['Code'])
+            self.srk_zjm.setText(config['USER']['zjm'])
+
+    def manual_save(self):  # 手动保存函数  port
+        ht = self.srk_ht.text()
+        port = self.srk_port.text()
+        token = self.srk_token.text()
+        code = self.srk_code.text()
+        zjm = self.srk_zjm.text()
+        if ht and port and token and code and zjm:
+            self.save_config(ht, port, token, code, zjm)
+            QMessageBox.information(self, "提示", "配置已保存！")
+        else:
+            QMessageBox.warning(self, "警告", "请填写完整的配置！")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = UserWindow()
+    window.show()
+    sys.exit(app.exec_())
