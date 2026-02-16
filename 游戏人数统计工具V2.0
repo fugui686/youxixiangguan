@@ -100,9 +100,9 @@ class DataWorker(QRunnable):  # 数据处理线程
                         retry_count += 1
                         print(f"[{self.group_name}] 请求失败（第 {retry_count} 次）：{e}")
                         self.signals.status.emit(
-                            f"[{self.group_name}] 请求失败（第 {retry_count} 次），随机延迟10~20s 后重试..."
+                            f"[{self.group_name}] 请求失败（第 {retry_count} 次），随机延迟10~15s 后重试..."
                         )
-                        time.sleep(random.randint(10, 20))  # 每次失败后随机等待 10~20 秒
+                        time.sleep(random.randint(10, 15))  # 每次失败后随机等待 10~15 秒
 
                 else:
                     # 三次都失败
@@ -325,7 +325,7 @@ class UserWindow(QWidget):  # 主窗口类
 
     def check_network_validation(self):
         try:
-            program_id = "zb_yxrs102"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            program_id = "游戏人数统计工具V2.0"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
             response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
             data = response.json()
 
@@ -513,8 +513,8 @@ class UserWindow(QWidget):  # 主窗口类
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(0)
 
-        version = getattr(self, "app_version", "v1.0.2")
-        update_date = getattr(self, "app_update_date", "2025-10-21")
+        version = getattr(self, "app_version", "V2.0")
+        update_date = getattr(self, "app_update_date", "2026-02-17")
 
         # 标题
         title = QLabel("关于游戏人数统计工具")
@@ -691,7 +691,7 @@ class UserWindow(QWidget):  # 主窗口类
         signals.raw_count.connect(self.on_raw_count)
 
         self.thread_pool.start(worker)
-        print(f"🧵 已启动线程任务：[{group}]")
+        print(f"🧵 已启动任务：[{group}]")
 
     def on_raw_count(self, group_name: str, raw_count: int):
         self.group_raw_counts[group_name] = raw_count
@@ -821,7 +821,7 @@ class UserWindow(QWidget):  # 主窗口类
         config.read('config.ini', encoding='utf-8')  # 指定 UTF-8，支持中英文
         if 'GROUP_COOKIES' in config:
             return list(config['GROUP_COOKIES'].keys())
-        return ["lvcha", "yaoji", "sejie", "aisebo", "xingf", "shaonv", "renqi", "lemi", "cshuang", "zhifu"]
+        return ["lvcha", "yaoji", "sejie", "aisebo", "xingf", "shaonv", "renqi", "lemi", "cshuang", "zhifu", "fupo", ]
 
     def save_config(self, port, token_dict, code):
         config = ConfigParser()
